@@ -1,0 +1,3 @@
+framework module ZStreamNativeSources {
+  header "ZStreamNativeSources-Swift.h"
+}

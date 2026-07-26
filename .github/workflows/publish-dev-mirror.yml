@@ -1,0 +1,51 @@
+name: Publish Dev Mirror
+
+# Builds the private ZStreamNativeSources.xcframework and pushes a stripped
+# copy of the repo (full app source, no resolver source, the compiled
+# framework dropped in instead) to the private dev-mirror repo the other dev
+# clones and builds/debugs locally. Re-run only when resolver internals
+# themselves change; the dev then just `git pull`s the mirror.
+#
+# Runs on workflow_dispatch, or on push when the commit message contains
+# '[ci-mirror]' — deliberately separate from build-ipa.yml's '[ci]' tag, so
+# a mirror-only change (e.g. a toolchain-version bump) doesn't also burn CI
+# minutes re-running build-ipa/verify-dev-mirror-build.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  publish-dev-mirror:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-mirror]')
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned to match the other dev's toolchain (Swift 6.3.3) — the
+      # xcframework isn't module-stable (see DEV-MIRROR.md), so it must be
+      # built with the exact same Swift version the consumer uses.
+      - name: Select Xcode 26.6
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.6"
+
+      - name: Cache BoringSSL build
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/build
+            ThirdParty/BoringSSL.xcframework
+          key: boringssl-ios-${{ hashFiles('scripts/build-boringssl.sh') }}
+
+      - name: Install build tools (xcodegen, ninja, go, xcbeautify)
+        run: brew install xcodegen ninja go xcbeautify
+
+      - name: Build BoringSSL.xcframework
+        run: ./scripts/build-boringssl.sh
+
+      - name: Publish dev mirror
+        env:
+          MIRROR_REMOTE: https://x-access-token:${{ secrets.MIRROR_PUSH_TOKEN }}@github.com/aaslam12/ZStream-iOS-Mirror-Dev.git
+          MIRROR_BRANCH: development
+        run: ./scripts/publish-dev-mirror.sh

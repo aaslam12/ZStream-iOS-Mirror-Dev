@@ -1,0 +1,170 @@
+name: Build IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci]')
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache BoringSSL build
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/build
+            ThirdParty/BoringSSL.xcframework
+          # Bump only changes when scripts/build-boringssl.sh's pinned commit changes.
+          key: boringssl-ios-${{ hashFiles('scripts/build-boringssl.sh') }}
+
+      - name: Install build tools (xcodegen, ninja, go, xcbeautify)
+        run: brew install xcodegen ninja go xcbeautify
+
+      - name: Build BoringSSL.xcframework
+        run: ./scripts/build-boringssl.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # Resolved Swift packages (MPVKit bundles a full ffmpeg build — this is
+      # the single biggest thing to avoid re-downloading/rebuilding every run).
+      # Keyed on project.yml since that's where package versions are pinned.
+      - name: Cache resolved Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-packages-${{ hashFiles('project.yml') }}
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project ZStream.xcodeproj \
+            -scheme ZStream \
+            -configuration Release \
+            -archivePath build/ZStream.xcarchive \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions
+
+      # NOTE: this produces an UNSIGNED .ipa (no ExportOptions.plist/signing
+      # identity wired up as CI secrets yet) — same trick scripts/xcarchive-to-ipa.sh
+      # already did locally, just run here so nobody has to download the
+      # .xcarchive and convert it by hand every time. Whoever installs it
+      # still signs it themselves (e.g. via Sideloadly).
+      - name: Convert archive to unsigned .ipa
+        run: ./scripts/xcarchive-to-ipa.sh build/ZStream.xcarchive ZStream.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZStream.ipa
+          path: build/ZStream.ipa
+          if-no-files-found: error
+
+      # bashupload.com is a no-signup temp file host — just a public download
+      # link for the person installing the build, no gh CLI/GitHub auth
+      # needed on their end. (0x0.st was tried first but actively blocks
+      # GitHub Actions' shared-runner IP ranges as anti-abuse — connection
+      # reset, curl exit 56 — so don't switch back to it.) Files expire after
+      # 3 days by default.
+      - name: Upload IPA to temp public link (bashupload.com)
+        run: |
+          set +e
+          response=$(curl -sS -T build/ZStream.ipa https://bashupload.com/ZStream.ipa)
+          curl_status=$?
+          set -e
+          echo "bashupload.com raw response (curl exit $curl_status):"
+          echo "$response"
+          url=$(echo "$response" | grep -oE 'https://bashupload\.com/[^[:space:]]*' | head -1)
+          if [ -z "$url" ]; then
+            echo "::warning::Could not get a bashupload.com link — see raw response above. Grab the .ipa from the 'ZStream.ipa' artifact instead."
+          else
+            echo "IPA download link: $url?download=1"
+            echo "### IPA download link" >> "$GITHUB_STEP_SUMMARY"
+            echo "$url?download=1" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZStream.xcarchive
+          path: build/ZStream.xcarchive
+          if-no-files-found: error
+
+  # Confirms the OTHER half of the resolver-privacy split still works: the
+  # app must build and link identically when ZStreamNativeSources is a
+  # prebuilt .xcframework (what the other dev's mirror repo ships) instead
+  # of the local source package (what the job above just built). Catches
+  # any drift between project.yml and project.dev-mirror.yml, or a symbol
+  # the app needs that didn't make it into NativeSources' public surface.
+  verify-dev-mirror-build:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci]')
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned to match the dev-mirror publish workflow's toolchain, so this
+      # verification build reflects what's actually shipped to the mirror.
+      - name: Select Xcode 26.6
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.6"
+
+      - name: Cache BoringSSL build
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/build
+            ThirdParty/BoringSSL.xcframework
+          key: boringssl-ios-${{ hashFiles('scripts/build-boringssl.sh') }}
+
+      - name: Install build tools (xcodegen, ninja, go, xcbeautify)
+        run: brew install xcodegen ninja go xcbeautify
+
+      - name: Build BoringSSL.xcframework
+        run: ./scripts/build-boringssl.sh
+
+      - name: Build ZStreamNativeSources.xcframework
+        run: ./scripts/build-native-sources-xcframework.sh build/xcframeworks
+
+      - name: Assemble mirror-style project
+        run: |
+          cp project.dev-mirror.yml project.yml
+          cp -R build/xcframeworks/ZStreamNativeSources.xcframework ZStreamNativeSources.xcframework
+          rm -rf Packages/ZStreamNativeSources
+
+      - name: Debug — inspect assembled xcframework
+        run: |
+          find ZStreamNativeSources.xcframework -maxdepth 4
+          echo "--- Info.plist ---"
+          plutil -p ZStreamNativeSources.xcframework/Info.plist
+
+      - name: Generate Xcode project (mirror variant)
+        run: xcodegen generate
+
+      - name: Cache resolved Swift packages (mirror variant)
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-packages-mirror-${{ hashFiles('project.dev-mirror.yml') }}
+
+      - name: Build (simulator, no archive — this job only verifies linkage)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project ZStream.xcodeproj \
+            -scheme ZStream \
+            -configuration Release \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions

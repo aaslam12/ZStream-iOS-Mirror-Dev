@@ -1,0 +1,110 @@
+name: Build IPA (Hardened)
+
+# Manual-only — never fires on push. Produces a stripped/obfuscated archive
+# meant to leave the building (e.g. for the signing dev), unlike the regular
+# `Build IPA` workflow which is for fast, readable testing builds.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ipa-hardened:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache BoringSSL build
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/build
+            ThirdParty/BoringSSL.xcframework
+          key: boringssl-ios-${{ hashFiles('scripts/build-boringssl.sh') }}
+
+      - name: Install build tools (xcodegen, ninja, go, xcbeautify)
+        run: brew install xcodegen ninja go xcbeautify
+
+      - name: Build BoringSSL.xcframework
+        run: ./scripts/build-boringssl.sh
+
+      - name: Obfuscate native resolver string literals
+        run: python3 scripts/obfuscate-strings.py
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # SwiftShield (Swift symbol renaming) was tried here and dropped: it
+      # segfaults on this project after ~10 min (its own README warns it's
+      # unmaintained with known SourceKit compatibility issues). Symbol
+      # stripping below plus native string obfuscation above cover the parts
+      # that actually matter (resolver endpoints, no readable debug symbols).
+
+      # Resolved Swift packages (MPVKit bundles a full ffmpeg build — this is
+      # the single biggest thing to avoid re-downloading/rebuilding every run).
+      # Keyed on project.yml since that's where package versions are pinned.
+      - name: Cache resolved Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-packages-${{ hashFiles('project.yml') }}
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project ZStream.xcodeproj \
+            -scheme ZStream \
+            -configuration Release \
+            -archivePath build/ZStream.xcarchive \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            STRIP_INSTALLED_PRODUCT=YES \
+            STRIP_STYLE=all \
+            DEPLOYMENT_POSTPROCESSING=YES \
+            GCC_SYMBOLS_PRIVATE_EXTERN=YES \
+            | xcbeautify --renderer github-actions
+
+      # Same caveat as the regular workflow: this is an UNSIGNED .ipa (no
+      # ExportOptions.plist/signing identity in CI yet) — the dev who owns
+      # those signs it themselves. Just saves the manual archive->ipa step.
+      - name: Convert archive to unsigned .ipa
+        run: ./scripts/xcarchive-to-ipa.sh build/ZStream.xcarchive ZStream-hardened.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZStream-hardened.ipa
+          path: build/ZStream-hardened.ipa
+          if-no-files-found: error
+
+      # bashupload.com is a no-signup temp file host — just a public download
+      # link for the person installing the build, no gh CLI/GitHub auth
+      # needed on their end. (0x0.st was tried first but actively blocks
+      # GitHub Actions' shared-runner IP ranges as anti-abuse — connection
+      # reset, curl exit 56 — so don't switch back to it.) Files expire after
+      # 3 days by default.
+      - name: Upload IPA to temp public link (bashupload.com)
+        run: |
+          set +e
+          response=$(curl -sS -T build/ZStream-hardened.ipa https://bashupload.com/ZStream-hardened.ipa)
+          curl_status=$?
+          set -e
+          echo "bashupload.com raw response (curl exit $curl_status):"
+          echo "$response"
+          url=$(echo "$response" | grep -oE 'https://bashupload\.com/[^[:space:]]*' | head -1)
+          if [ -z "$url" ]; then
+            echo "::warning::Could not get a bashupload.com link — see raw response above. Grab the .ipa from the 'ZStream-hardened.ipa' artifact instead."
+          else
+            echo "IPA download link: $url?download=1"
+            echo "### IPA download link" >> "$GITHUB_STEP_SUMMARY"
+            echo "$url?download=1" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZStream-hardened.xcarchive
+          path: build/ZStream.xcarchive
+          if-no-files-found: error

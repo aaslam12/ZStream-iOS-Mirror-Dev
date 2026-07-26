@@ -1,0 +1,24 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+
+# XcodeGen generates this — regenerate with `xcodegen generate`
+*.xcodeproj
+
+# CocoaPods (if added later)
+Pods/
+
+# BoringSSL — built by scripts/build-boringssl.sh, not committed
+third_party/
+ThirdParty/
+
+# macOS
+.DS_Store
+
+# Env Config
+*.xcconfig
+!*.example.xcconfig
+archive/
